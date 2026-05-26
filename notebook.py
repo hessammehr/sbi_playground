@@ -126,7 +126,6 @@ def _(TILE_H, TILE_W, jnp):
         EMB_DIM,
         K_COMP,
         LIK_HIDDEN,
-        LIK_IN,
         LOG_SCALE_MAX,
         LOG_SCALE_MIN,
         N_SLOTS,
@@ -140,25 +139,31 @@ def _(
     BG_DIMS,
     EMB_DIM,
     LIK_HIDDEN,
-    LIK_IN,
+    LOG_SCALE_MAX,
+    LOG_SCALE_MIN,
     N_SLOTS,
     PER_SLOT_DIMS,
     POST_HIDDEN,
     TILE_H,
     TILE_W,
+    jnp,
     nn,
 ):
     # --- Flax modules ---------------------------------------------------------
     # Three small nets:
-    #   Encoder      : (H, W, 3) -> (EMB_DIM,)   3-block stride-2 CNN + linear head
-    #   PosteriorHead: (EMB_DIM,) -> (bg head (BG_DIMS,2), slot head (N_SLOTS,PER_SLOT_DIMS,2))
-    #   LikelihoodMLP: per-pixel droplet appearance residual
+    #   Encoder        : (H, W, 3) -> (EMB_DIM,)         3-block stride-2 CNN + linear
+    #   PosteriorHead  : (EMB_DIM,) -> (bg head, slot head)
+    #   LikelihoodMLP  : per-pixel droplet residual, FACTORED as
+    #                       delta = colour_head(comp) * spatial_gain(bg, offset, log_scale)
+    #                    so that the "what" (composition -> colour) and the "where"
+    #                    (spatial profile) cannot leak into each other.
+    #                    This dodges the prior-predictive failure mode where a
+    #                    nuisance-feature bias dominates the comp signal.
 
     class Encoder(nn.Module):
         emb_dim: int = EMB_DIM
         @nn.compact
         def __call__(self, x):
-            # x: (H, W, 3) -- prepend batch axis for flax.Conv (NHWC convention).
             x = x[None]
             for c in (16, 32, 64):
                 x = nn.Conv(c, (3, 3), strides=(2, 2), padding="SAME")(x)
@@ -182,22 +187,41 @@ def _(
             return bg, slots
 
     class LikelihoodMLP(nn.Module):
-        """Per-pixel droplet residual. Final-layer init scaled down so droplets
-        are subtle (but non-trivial) at initialisation."""
+        """Factored droplet appearance:
+           delta = colour(comp) * spatial(bg, offset_norm, log_scale)
+        where colour: R^K -> R^3 and spatial: R^(3+2+1) -> R (scalar gain).
+        Inputs are normalised to roughly O(1) before the MLPs so init balances.
+
+        Args to __call__:
+           bg          : (..., 3)
+           comp        : (..., K)
+           offset_norm : (..., 2)        already in droplet-local frame
+           log_scale   : (...,)          raw log_scale value
+        """
         hidden: int = LIK_HIDDEN
-        out: int = 3
-        final_scale: float = 0.3
         @nn.compact
-        def __call__(self, feats):
-            x = nn.Dense(self.hidden)(feats); x = nn.gelu(x)
-            x = nn.Dense(self.hidden)(x);     x = nn.gelu(x)
-            x = nn.Dense(
-                self.out,
-                kernel_init=nn.initializers.variance_scaling(
-                    self.final_scale ** 2, "fan_in", "uniform",
-                ),
-            )(x)
-            return x
+        def __call__(self, bg, comp, offset_norm, log_scale):
+            # Normalise nuisance features
+            bg_n = (bg - 0.5) * 2.0                        # bg in [0,1] -> ~[-1,1]
+            # offset_norm is already O(1) (Mahalanobis scaled), keep
+            ls_mid = 0.5 * (LOG_SCALE_MIN + LOG_SCALE_MAX)
+            ls_range = 0.5 * (LOG_SCALE_MAX - LOG_SCALE_MIN)
+            ls_n = (log_scale - ls_mid) / ls_range          # ~[-1,1]
+            ls_n = ls_n[..., None] if jnp.ndim(ls_n) == jnp.ndim(bg_n) - 1 else ls_n
+
+            # Colour head: comp -> R^3 (bias-free final so comp=0 -> colour=0)
+            c = nn.Dense(self.hidden)(comp); c = nn.gelu(c)
+            c = nn.Dense(self.hidden)(c); c = nn.gelu(c)
+            colour = nn.Dense(3, use_bias=False)(c)         # (..., 3)
+
+            # Spatial head: (bg_n, offset_norm, ls_n) -> R (scalar gain)
+            spatial_in = jnp.concatenate([bg_n, offset_norm, ls_n], axis=-1)
+            s = nn.Dense(self.hidden)(spatial_in); s = nn.gelu(s)
+            s = nn.Dense(self.hidden)(s); s = nn.gelu(s)
+            # final scaled init + softplus bias so initial gain is ~1 (visible droplet)
+            gain = nn.Dense(1, kernel_init=nn.initializers.variance_scaling(0.3**2, "fan_in", "uniform"),
+                            bias_init=nn.initializers.constant(0.5))(s)        # (..., 1)
+            return colour * gain                            # (..., 3)
 
     encoder_module = Encoder()
     posterior_module = PosteriorHead(
@@ -205,14 +229,15 @@ def _(
     )
     likelihood_module = LikelihoodMLP()
 
+    # Flax input shape probes for module init
     ENC_IN_SHAPE = (TILE_H, TILE_W, 3)
     POST_IN_SHAPE = (EMB_DIM,)
-    LIK_IN_SHAPE = (LIK_IN,)
-    print("flax modules defined")
+    # Likelihood now has 4 separate input args -> we pass init args directly
+    # below via flax_module(*args).
+    print("flax modules defined (factored likelihood: colour * spatial)")
 
     return (
         ENC_IN_SHAPE,
-        LIK_IN_SHAPE,
         POST_IN_SHAPE,
         encoder_module,
         likelihood_module,
@@ -223,21 +248,13 @@ def _(
 @app.cell(hide_code=True)
 def _(jnp):
     # --- Per-droplet pixel update ---------------------------------------------
-    # Same factoring as before:
-    #   out = bg + presence * envelope(||offset_norm||) * delta(bg, comp, offset, log_scale)
-    # Both invariants exact:
-    #   - presence -> 0  => out == bg
-    #   - ||offset_norm|| -> inf  =>  out == bg
-    # `delta` is now the flax LikelihoodMLP (parameters registered via flax_module
-    # inside the prior_model / loss functions).
+    # Same invariants as before:
+    #   out = bg + presence * env(||offset_norm||) * delta(bg, comp, offset, log_scale)
+    # delta now comes from the factored LikelihoodMLP (colour*spatial gain).
 
     def apply_droplet(lik_apply, bg, comp, offset_norm, log_scale, presence):
-        """lik_apply: callable feats -> delta. Shapes broadcast over leading dims."""
-        feats = jnp.concatenate([
-            bg, comp, offset_norm,
-            log_scale[..., None] if jnp.ndim(log_scale) > 0 else jnp.array([log_scale]),
-        ], axis=-1)
-        delta = lik_apply(feats)
+        """lik_apply: callable (bg, comp, offset_norm, log_scale) -> delta R^3."""
+        delta = lik_apply(bg, comp, offset_norm, log_scale)
         r2 = (offset_norm ** 2).sum(axis=-1)
         env = jnp.exp(-0.5 * r2)
         gate = (presence * env)[..., None]
@@ -302,13 +319,10 @@ def _(
             center, ls, la, th, comp, pres = slot
             L = droplet_L(ls, la, th)
             offset_norm = (px - center) @ L.T
-            feats = jnp.concatenate([
-                img,
-                jnp.broadcast_to(comp, (H, W, K_COMP)),
-                offset_norm,
-                jnp.broadcast_to(ls, (H, W))[..., None],
-            ], axis=-1)
-            delta = lik_apply(feats)
+            # broadcast per-droplet scalars to per-pixel
+            comp_b = jnp.broadcast_to(comp, (H, W, K_COMP))
+            ls_b = jnp.broadcast_to(ls, (H, W))
+            delta = lik_apply(img, comp_b, offset_norm, ls_b)
             env = jnp.exp(-0.5 * (offset_norm ** 2).sum(-1))
             new = img + (pres * env)[..., None] * delta
             return new, None
@@ -365,7 +379,7 @@ def _(
 
 @app.cell(hide_code=True)
 def _(
-    LIK_IN,
+    K_COMP,
     Predictive,
     jax,
     jnp,
@@ -383,7 +397,9 @@ def _(
     def _init_lik_params(key):
         """Initialise just the likelihood module params for prior-predictive runs
         BEFORE training begins."""
-        return likelihood_module.init(key, jnp.zeros((LIK_IN,)))
+        return likelihood_module.init(
+            key, jnp.zeros((3,)), jnp.zeros((K_COMP,)), jnp.zeros((2,)), jnp.zeros(()),
+        )
 
     lik_params_init = _init_lik_params(jr.PRNGKey(42))
 
@@ -393,7 +409,7 @@ def _(
         samples = pred(key)
         flat = {k: v[0] for k, v in samples.items()}
         packed = pack_latents(flat)
-        lik = lambda feats: likelihood_module.apply(lik_params, feats)
+        lik = lambda bg, comp, off, ls: likelihood_module.apply(lik_params, bg, comp, off, ls)
         img = simulate_tile(lik, packed)
         return img, packed
 
@@ -490,7 +506,7 @@ def _(
 @app.cell(hide_code=True)
 def _(
     ENC_IN_SHAPE,
-    LIK_IN_SHAPE,
+    K_COMP,
     POST_IN_SHAPE,
     encoder_module,
     flax_module,
@@ -527,7 +543,11 @@ def _(
         return their bound apply-functions."""
         encoder = flax_module("encoder", encoder_module, input_shape=ENC_IN_SHAPE)
         posterior = flax_module("posterior", posterior_module, input_shape=POST_IN_SHAPE)
-        likelihood = flax_module("likelihood", likelihood_module, input_shape=LIK_IN_SHAPE)
+        # Likelihood takes 4 named inputs; supply dummy positional init args.
+        likelihood = flax_module(
+            "likelihood", likelihood_module,
+            jnp.zeros((3,)), jnp.zeros((K_COMP,)), jnp.zeros((2,)), jnp.zeros(()),
+        )
         return encoder, posterior, likelihood
 
     def npe_loss_one(encoder, posterior, latents, image):
@@ -670,7 +690,7 @@ def _(
     @jax.jit
     def _step(params, opt_state, key, real_imgs):
         lik_params_pytree = {"params": params["likelihood$params"]}
-        lik = lambda feats: likelihood_module.apply(lik_params_pytree, feats)
+        lik = lambda bg, comp, off, ls: likelihood_module.apply(lik_params_pytree, bg, comp, off, ls)
         sim_lats, sim_imgs = sim_batch(key, lik, BATCH)
         (total, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             params, sim_lats, sim_imgs, real_imgs,
@@ -725,14 +745,18 @@ def _(
 ):
     # --- Inspect amortized posterior on real tiles ----------------------------
 
-    def _bound_apply(module, params, suffix):
+    def _bound_apply_one(module, params, suffix):
         p = {"params": params[f"{suffix}$params"]}
         return lambda x: module.apply(p, x)
 
+    def _bound_apply_lik(params):
+        p = {"params": params["likelihood$params"]}
+        return lambda bg, comp, off, ls: likelihood_module.apply(p, bg, comp, off, ls)
+
     @jax.jit
     def infer_latents_mean(params, image):
-        encoder = _bound_apply(encoder_module, params, "encoder")
-        posterior = _bound_apply(posterior_module, params, "posterior")
+        encoder = _bound_apply_one(encoder_module, params, "encoder")
+        posterior = _bound_apply_one(posterior_module, params, "posterior")
         emb = encoder(image)
         bg_head, slot_head = posterior(emb)
         bg_u = bg_head[:, 0]; slots_u = slot_head[..., 0]
@@ -741,7 +765,7 @@ def _(
     @jax.jit
     def infer_and_render(params, image):
         latents = infer_latents_mean(params, image)
-        likelihood = _bound_apply(likelihood_module, params, "likelihood")
+        likelihood = _bound_apply_lik(params)
         return latents, simulate_tile(likelihood, latents)
 
     def _show_inference(params, real_tiles, n=6):
