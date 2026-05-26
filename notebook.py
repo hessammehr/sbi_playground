@@ -661,7 +661,7 @@ def _(
     import optax
 
     BATCH = 8
-    LAMBDA_REC = 200.0     # rescale so both terms have comparable gradient magnitudes
+    LAMBDA_REC = 5000.0     # rescale so both terms have comparable gradient magnitudes
     LR = 3e-4
 
     def init_all_params(key):
