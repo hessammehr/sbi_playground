@@ -534,7 +534,7 @@ def _(
     # we just want gradient descent on  -log_p_factors  w.r.t. the flax params.
 
     BATCH = 8
-    LAMBDA_REC = 5000.0
+    LAMBDA_REC = 15000.0
     LAMBDA_OVERLAP = 50.0
     LR = 3e-4
 
@@ -638,12 +638,12 @@ def _(
     # --- Training loop --------------------------------------------------------
     import time as _time
 
-    N_STEPS = 1500
-    LOG_EVERY = 50
+    N_STEPS = 5000
+    LOG_EVERY = 200
     # Curriculum: pure NPE for the first WARMUP steps, then linearly ramp
     # in recon and overlap losses to their full values by RAMP_END.
     WARMUP_END = 500
-    RAMP_END = 1000
+    RAMP_END = 2500
 
     def sim_batch(key, likelihood, B):
         pred = Predictive(prior_model, num_samples=B)
