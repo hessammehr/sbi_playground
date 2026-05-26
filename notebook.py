@@ -106,7 +106,7 @@ def _(TILE_H, TILE_W, jnp):
     N_SLOTS = 32          # max objects per tile (presence gates inactive slots)
     K_COMP = 3            # composition dim (interpretable as RGB-ish; mapped via MLP)
     EMB_DIM = 128         # image embedding dim
-    LIK_HIDDEN = 32       # hidden width of learned likelihood MLP
+    LIK_HIDDEN = 64       # hidden width of learned likelihood MLP
     POST_HIDDEN = 128     # hidden width of posterior heads
 
     # Reasonable scale range: droplets in the example span ~3..30 px radius.
@@ -276,6 +276,29 @@ def _(
     numpyro,
 ):
     # --- Background prior + droplet shape parameterization --------------------
+
+    # --- Overlap penalty (pairwise Gaussian repulsion) ------------------------
+    # Differentiable, presence-gated soft-DPP / Strauss-style pair potential:
+    #
+    #   E_overlap(X) = sum_{i<j} pres_i * pres_j * exp(-||c_i - c_j||^2 / (2 r^2))
+    #
+    # Used as (i) a numpyro.factor inside prior_model so the joint prior is
+    # repulsive, and (ii) an explicit regulariser in the training loss that the
+    # posterior also pays at inference time (keeps slots from clustering).
+
+    OVERLAP_R = 6.0   # repulsion radius in pixels; ~min droplet radius
+    OVERLAP_W = 4.0   # log-weight; tune so E[OVERLAP_W * E_overlap] is comparable
+                      # to the other prior terms.
+
+    def overlap_penalty(centers, presence, r=OVERLAP_R):
+        diff = centers[:, None, :] - centers[None, :, :]
+        d2 = (diff ** 2).sum(-1)                                # (N, N)
+        pair = jnp.exp(-d2 / (2.0 * r ** 2))                    # (N, N)
+        mask = presence[:, None] * presence[None, :]            # (N, N)
+        # Strict upper triangle so each pair counted once and diagonal is excluded
+        triu = jnp.triu(jnp.ones_like(pair), k=1)
+        return (pair * mask * triu).sum()
+
     def render_background(bg_corners, H, W):
         """bg_corners: (4, 3) for TL, TR, BL, BR. Bilinear interp -> (H, W, 3)."""
         ys = jnp.linspace(0.0, 1.0, H)
@@ -352,6 +375,8 @@ def _(
                                   dist.Normal(jnp.zeros(K_COMP), 1.0).to_event(1))
             presence = numpyro.sample("presence", dist.Beta(0.3, 0.3))
         centers = jnp.stack([cy, cx], axis=-1)
+        # Repulsion factor on the joint prior (presence-gated).
+        numpyro.factor("overlap", -OVERLAP_W * overlap_penalty(centers, presence))
         return dict(
             bg_corners=bg_corners, centers=centers,
             log_scale=log_scale, log_aspect=log_aspect, theta=theta,
@@ -378,7 +403,7 @@ def _(
 
     print("simulator + prior defined")
 
-    return OBS_SIGMA, pack_latents, prior_model, simulate_tile
+    return OBS_SIGMA, overlap_penalty, pack_latents, prior_model, simulate_tile
 
 
 @app.cell(hide_code=True)
@@ -632,6 +657,7 @@ def _(
     jnp,
     jr,
     lik_init,
+    overlap_penalty,
     pack_latents,
     post_apply,
     post_init,
@@ -690,14 +716,18 @@ def _(
 
     def recon_loss_one(cnn_p, post_p, lik_p, image):
         """Use posterior MEAN to render (no sampling) -- direct supervision on
-        the deterministic forward map. Gradients flow through cnn, post, and lik."""
+        the deterministic forward map. Returns (mse, latents) so the caller can
+        also penalise overlap at inference time."""
         emb = cnn_apply(cnn_p, image)
         bg_head, slot_head = post_apply(post_p, emb)
         bg_u = bg_head[:, 0]
         slots_u = slot_head[..., 0]
         latents = unconstrained_to_latents(bg_u, slots_u)
         sim = simulate_tile(lik_p, latents)
-        return jnp.mean((sim - image) ** 2)
+        mse = jnp.mean((sim - image) ** 2)
+        return mse, latents
+
+    LAMBDA_OVERLAP = 50.0  # pressure on inferred posterior centers to spread out
 
     def total_loss(p, sim_latents, sim_images, real_images):
         def per_npe(i, img):
@@ -705,9 +735,14 @@ def _(
             return npe_loss_one(p["cnn"], p["post"], latents_i, img)
         L_npe = vmap(per_npe)(jnp.arange(sim_images.shape[0]), sim_images).mean()
         def per_rec(img):
-            return recon_loss_one(p["cnn"], p["post"], p["lik"], img)
-        L_rec = vmap(per_rec)(real_images).mean()
-        return L_npe + LAMBDA_REC * L_rec, (L_npe, L_rec)
+            mse, lat = recon_loss_one(p["cnn"], p["post"], p["lik"], img)
+            ov = overlap_penalty(lat["centers"], lat["presence"])
+            return mse, ov
+        rec_mses, rec_ovs = vmap(per_rec)(real_images)
+        L_rec = rec_mses.mean()
+        L_ov = rec_ovs.mean()
+        total = L_npe + LAMBDA_REC * L_rec + LAMBDA_OVERLAP * L_ov
+        return total, (L_npe, L_rec, L_ov)
 
     optimizer = optax.adam(LR)
 
@@ -752,9 +787,9 @@ def _(jr, opt_state_init, params_init, real_tiles, train_step):
             key, sk = jr.split(key)
             params, opt_state, loss, aux = train_step(params, opt_state, sk, real_images)
             if step % LOG_EVERY == 0 or step == n_steps - 1:
-                l = float(loss); n = float(aux[0]); r = float(aux[1])
-                history.append((step, l, n, r))
-                print(f"step {step:5d}  total={l:9.2f}  npe={n:9.2f}  rec={r:.4f}  "
+                l = float(loss); n = float(aux[0]); r = float(aux[1]); ov = float(aux[2])
+                history.append((step, l, n, r, ov))
+                print(f"step {step:5d}  total={l:9.2f}  npe={n:9.2f}  rec={r:.4f}  ov={ov:.3f}  "
                       f"({(_time.time()-t0)/(step+1)*1000:.1f} ms/step)")
         return params, opt_state, key, history
 
