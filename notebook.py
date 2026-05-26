@@ -568,11 +568,11 @@ def _(
         ov = overlap_penalty(latents["centers"], latents["presence"])
         return mse, ov
 
-    def training_model(sim_latents, sim_images, real_images):
-        """A numpyro model whose log-prob equals -[NPE + lam*REC + mu*OV]. Calling
-        it under a `seed` handler with `numpyro.handlers.trace` gives a dict of
-        factor sites; SVI with an empty guide minimises -log_factors w.r.t. the
-        flax_module params."""
+    def training_model(sim_latents, sim_images, real_images,
+                       lambda_rec=LAMBDA_REC, lambda_ov=LAMBDA_OVERLAP):
+        """numpyro model whose log-prob equals -[NPE + lambda_rec*REC + lambda_ov*OV].
+        Weights are passable so an outer training loop can run a curriculum
+        (e.g. lambda_rec=0 for pure NPE warmup)."""
         encoder, posterior, likelihood = _bind_modules()
 
         def per_npe(i, img):
@@ -586,10 +586,9 @@ def _(
         L_rec = rec_mses.mean()
         L_ov = ovs.mean()
 
-        # Expose as numpyro factors (negative loss == positive log-prob)
         numpyro.factor("L_npe", -L_npe)
-        numpyro.factor("L_rec", -LAMBDA_REC * L_rec)
-        numpyro.factor("L_overlap", -LAMBDA_OVERLAP * L_ov)
+        numpyro.factor("L_rec", -lambda_rec * L_rec)
+        numpyro.factor("L_overlap", -lambda_ov * L_ov)
         numpyro.deterministic("aux_L_npe", L_npe)
         numpyro.deterministic("aux_L_rec", L_rec)
         numpyro.deterministic("aux_L_overlap", L_ov)
@@ -639,8 +638,12 @@ def _(
     # --- Training loop --------------------------------------------------------
     import time as _time
 
-    N_STEPS = 500
+    N_STEPS = 1500
     LOG_EVERY = 50
+    # Curriculum: pure NPE for the first WARMUP steps, then linearly ramp
+    # in recon and overlap losses to their full values by RAMP_END.
+    WARMUP_END = 500
+    RAMP_END = 1000
 
     def sim_batch(key, likelihood, B):
         pred = Predictive(prior_model, num_samples=B)
@@ -671,45 +674,58 @@ def _(
                 out[name] = site["value"]
         return out
 
-    def loss_fn(params, sim_lats, sim_imgs, real_imgs):
-        """Compute total loss + auxiliaries given a flat dict of all flax params."""
+    def loss_fn(params, sim_lats, sim_imgs, real_imgs, lam_rec, lam_ov):
+        """Compute total loss + auxiliaries with curriculum weights."""
         handler = numpyro.handlers.substitute(
             numpyro.handlers.seed(training_model, rng_seed=0),
             data=params,
         )
         with numpyro.handlers.trace() as tr:
-            handler(sim_lats, sim_imgs, real_imgs)
+            handler(sim_lats, sim_imgs, real_imgs, lam_rec, lam_ov)
         L_npe = tr["aux_L_npe"]["value"]
         L_rec = tr["aux_L_rec"]["value"]
         L_ov  = tr["aux_L_overlap"]["value"]
-        total = L_npe + LAMBDA_REC * L_rec + LAMBDA_OVERLAP * L_ov
+        total = L_npe + lam_rec * L_rec + lam_ov * L_ov
         return total, (L_npe, L_rec, L_ov)
 
     _optimizer = optax.adam(LR)
 
     @jax.jit
-    def _step(params, opt_state, key, real_imgs):
+    def _step(params, opt_state, key, real_imgs, lam_rec, lam_ov):
         lik_params_pytree = {"params": params["likelihood$params"]}
         lik = lambda bg, comp, off, ls: likelihood_module.apply(lik_params_pytree, bg, comp, off, ls)
         sim_lats, sim_imgs = sim_batch(key, lik, BATCH)
         (total, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            params, sim_lats, sim_imgs, real_imgs,
+            params, sim_lats, sim_imgs, real_imgs, lam_rec, lam_ov,
         )
         updates, opt_state = _optimizer.update(grads, opt_state)
         params = optax.apply_updates(params, updates)
         return params, opt_state, total, aux
 
-    def _train(n_steps, params, opt_state, key, real_imgs):
+    def schedule(step):
+        """Curriculum: pure NPE for [0, WARMUP_END), linear ramp on [WARMUP_END, RAMP_END),
+        full weights afterwards."""
+        if step < WARMUP_END:
+            f = 0.0
+        elif step < RAMP_END:
+            f = (step - WARMUP_END) / float(RAMP_END - WARMUP_END)
+        else:
+            f = 1.0
+        return jnp.float32(LAMBDA_REC * f), jnp.float32(LAMBDA_OVERLAP * f)
+
+    def _train(n_steps, params, opt_state, key, real_imgs, start_step=0):
         history = []
         t0 = _time.time()
-        for step in range(n_steps):
+        for step in range(start_step, start_step + n_steps):
             key, sk = jr.split(key)
-            params, opt_state, total, aux = _step(params, opt_state, sk, real_imgs)
-            if step % LOG_EVERY == 0 or step == n_steps - 1:
+            lam_rec, lam_ov = schedule(step)
+            params, opt_state, total, aux = _step(params, opt_state, sk, real_imgs, lam_rec, lam_ov)
+            if step % LOG_EVERY == 0 or step == start_step + n_steps - 1:
                 l = float(total); n = float(aux[0]); r = float(aux[1]); ov = float(aux[2])
                 history.append((step, l, n, r, ov))
-                print(f"step {step:5d}  total={l:9.2f}  npe={n:9.2f}  rec={r:.4f}  ov={ov:.3f}  "
-                      f"({(_time.time()-t0)/(step+1)*1000:.1f} ms/step)")
+                print(f"step {step:5d}  lam_rec={float(lam_rec):6.1f}  total={l:9.2f}  "
+                      f"npe={n:9.2f}  rec={r:.4f}  ov={ov:.3f}  "
+                      f"({(_time.time()-t0)/(step-start_step+1)*1000:.1f} ms/step)")
         return params, opt_state, key, history
 
     # Initialise params and optimiser
