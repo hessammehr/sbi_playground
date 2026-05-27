@@ -23,7 +23,6 @@ def _():
 
     jax.config.update("jax_enable_x64", False)
     print("devices:", jax.devices())
-
     return (
         Image,
         Predictive,
@@ -83,8 +82,7 @@ def _(Image, jnp, jr, lax, np, vmap):
 
     real_tiles = deterministic_tiles(img_full)
     print("real tiles:", real_tiles.shape)
-
-    return TILE_H, TILE_W, real_tiles
+    return TILE_H, TILE_W, img_full, random_crop_batch, real_tiles
 
 
 @app.cell(hide_code=True)
@@ -99,7 +97,6 @@ def _(np, plt, real_tiles):
         fig.tight_layout()
         return fig
     _show_real_tiles()
-
     return
 
 
@@ -120,7 +117,6 @@ def _(TILE_H, TILE_W, jnp):
     LOG_SCALE_MIN, LOG_SCALE_MAX = jnp.log(2.0), jnp.log(30.0)
 
     print(f"slots={N_SLOTS}, K={K_COMP}, tile={TILE_H}x{TILE_W}")
-
     return (
         BG_DIMS,
         EMB_DIM,
@@ -161,14 +157,25 @@ def _(
     #                    nuisance-feature bias dominates the comp signal.
 
     class Encoder(nn.Module):
+        """Spatial-preserving CNN encoder. Global average pooling DESTROYS spatial
+        information (a droplet at (10,10) and one at (80,80) would pool to the same
+        vector), causing catastrophic encoder collapse. Here we keep the spatial
+        layout and use a 1x1 conv "neck" to compress channels before flattening --
+        this gives a sane-sized dense layer (12*12*16 = 2304 -> EMB_DIM) instead
+        of a 9216-feature monster that breaks ptxas.
+        """
         emb_dim: int = EMB_DIM
         @nn.compact
         def __call__(self, x):
-            x = x[None]
+            x = x[None]                                    # (1, H, W, 3)
+            # 96 -> 48 -> 24 -> 12 spatial, channels 3 -> 16 -> 32 -> 64
             for c in (16, 32, 64):
                 x = nn.Conv(c, (3, 3), strides=(2, 2), padding="SAME")(x)
                 x = nn.gelu(x)
-            x = x.mean(axis=(1, 2))[0]
+            # 1x1 conv neck: 12x12x64 -> 12x12x16
+            x = nn.Conv(16, (1, 1))(x)
+            x = nn.gelu(x)
+            x = x.reshape((x.shape[0], -1))[0]             # flatten -> 12*12*16 = 2304
             x = nn.Dense(self.emb_dim)(x)
             return x
 
@@ -235,7 +242,6 @@ def _(
     # Likelihood now has 4 separate input args -> we pass init args directly
     # below via flax_module(*args).
     print("flax modules defined (factored likelihood: colour * spatial)")
-
     return (
         ENC_IN_SHAPE,
         POST_IN_SHAPE,
@@ -373,7 +379,6 @@ def _(
 
     OBS_SIGMA = 0.03
     print("simulator + prior defined (flax-aware)")
-
     return OBS_SIGMA, overlap_penalty, pack_latents, prior_model, simulate_tile
 
 
@@ -428,7 +433,6 @@ def _(
         fig.tight_layout()
         return fig
     _do_ppc()
-
     return
 
 
@@ -495,7 +499,6 @@ def _(
         return lp_bg + (lp_per_true * present_mask).sum()
 
     print("unconstrained transforms + set-NPE log-prob ready")
-
     return (
         post_log_prob_set,
         true_latents_to_unconstrained,
@@ -558,6 +561,9 @@ def _(
         return -post_log_prob_set(bg_head, slot_head, bg_u, slots_u, present_mask)
 
     def recon_and_overlap_one(encoder, posterior, likelihood, image):
+        """Reconstruction MSE + overlap penalty (no cycle term -- removed since it
+        was being satisfied by posterior-sigma collapse, not by improving
+        fidelity)."""
         emb = encoder(image)
         bg_head, slot_head = posterior(emb)
         bg_u = bg_head[:, 0]
@@ -570,9 +576,7 @@ def _(
 
     def training_model(sim_latents, sim_images, real_images,
                        lambda_rec=LAMBDA_REC, lambda_ov=LAMBDA_OVERLAP):
-        """numpyro model whose log-prob equals -[NPE + lambda_rec*REC + lambda_ov*OV].
-        Weights are passable so an outer training loop can run a curriculum
-        (e.g. lambda_rec=0 for pure NPE warmup)."""
+        """numpyro model whose log-prob equals -[NPE + lambda_rec*REC + lambda_ov*OV]."""
         encoder, posterior, likelihood = _bind_modules()
 
         def per_npe(i, img):
@@ -584,7 +588,7 @@ def _(
             return recon_and_overlap_one(encoder, posterior, likelihood, img)
         rec_mses, ovs = vmap(per_rec)(real_images)
         L_rec = rec_mses.mean()
-        L_ov = ovs.mean()
+        L_ov  = ovs.mean()
 
         numpyro.factor("L_npe", -L_npe)
         numpyro.factor("L_rec", -lambda_rec * L_rec)
@@ -608,8 +612,38 @@ def _(
     # We will create the SVI state inside the loop cell, so that we can re-run
     # the loop and pick up where we left off via the SVI state object.
     print("training_model ready")
-
     return BATCH, LAMBDA_OVERLAP, LAMBDA_REC, LR, training_model
+
+
+@app.cell(hide_code=True)
+def _(
+    Predictive,
+    TILE_H,
+    TILE_W,
+    jax,
+    jr,
+    numpyro,
+    pack_latents,
+    prior_model,
+    training_model,
+):
+    # --- Random parameter initialisation (no training) ------------------------
+    # Source of `params` outside the training loop. Cheap (one trace pass). Run
+    # this and the loop cell becomes a pure no-op (TRAIN=False default).
+
+    def fresh_params(key=jr.PRNGKey(0), batch=4):
+        dummy_lats = pack_latents(Predictive(prior_model, num_samples=batch)(key))
+        dummy_imgs = jr.uniform(jr.fold_in(key, 2), (batch, TILE_H, TILE_W, 3))
+        with numpyro.handlers.trace() as tr, numpyro.handlers.seed(rng_seed=int(key[1])):
+            training_model(dummy_lats, dummy_imgs, dummy_imgs)
+        return {n: s["value"] for n, s in tr.items() if s["type"] == "param"}
+
+    params = fresh_params()
+    print("fresh param counts:")
+    for k in params:
+        n = sum(x.size for x in jax.tree_util.tree_leaves(params[k]))
+        print(f"  {k:>20}: {n:>10}")
+    return (params,)
 
 
 @app.cell(hide_code=True)
@@ -622,6 +656,7 @@ def _(
     Predictive,
     TILE_H,
     TILE_W,
+    img_full,
     jax,
     jnp,
     jr,
@@ -629,8 +664,9 @@ def _(
     numpyro,
     optax,
     pack_latents,
+    params,
     prior_model,
-    real_tiles,
+    random_crop_batch,
     simulate_tile,
     training_model,
     vmap,
@@ -639,7 +675,8 @@ def _(
     import time as _time
 
     N_STEPS = 5000
-    LOG_EVERY = 200
+    N_STEPS_CONTINUE = 200
+    LOG_EVERY = 50
     # Curriculum: pure NPE for the first WARMUP steps, then linearly ramp
     # in recon and overlap losses to their full values by RAMP_END.
     WARMUP_END = 500
@@ -691,10 +728,15 @@ def _(
     _optimizer = optax.adam(LR)
 
     @jax.jit
-    def _step(params, opt_state, key, real_imgs, lam_rec, lam_ov):
+    def _step(params, opt_state, key, img_full_, lam_rec, lam_ov):
+        """One gradient step. `img_full_` is the FULL real image (H_full, W_full, 3);
+        we sample a fresh batch of BATCH random crops every step so the real-image
+        training distribution is effectively infinite (no memorisation possible)."""
+        k_crop, k_sim = jr.split(key)
+        real_imgs = random_crop_batch(img_full_, k_crop, BATCH)
         lik_params_pytree = {"params": params["likelihood$params"]}
         lik = lambda bg, comp, off, ls: likelihood_module.apply(lik_params_pytree, bg, comp, off, ls)
-        sim_lats, sim_imgs = sim_batch(key, lik, BATCH)
+        sim_lats, sim_imgs = sim_batch(k_sim, lik, BATCH)
         (total, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(
             params, sim_lats, sim_imgs, real_imgs, lam_rec, lam_ov,
         )
@@ -703,43 +745,53 @@ def _(
         return params, opt_state, total, aux
 
     def schedule(step):
-        """Curriculum: pure NPE for [0, WARMUP_END), linear ramp on [WARMUP_END, RAMP_END),
-        full weights afterwards."""
+        """Curriculum:
+          [0, WARMUP_END)        : NPE only
+          [WARMUP_END, RAMP_END) : linear ramp on REC and OVERLAP
+        """
         if step < WARMUP_END:
             f = 0.0
         elif step < RAMP_END:
             f = (step - WARMUP_END) / float(RAMP_END - WARMUP_END)
         else:
             f = 1.0
-        return jnp.float32(LAMBDA_REC * f), jnp.float32(LAMBDA_OVERLAP * f)
+        return (jnp.float32(LAMBDA_REC * f),
+                jnp.float32(LAMBDA_OVERLAP * f))
 
-    def _train(n_steps, params, opt_state, key, real_imgs, start_step=0):
+    def _train(n_steps, params, opt_state, key, img_full_, start_step=0):
         history = []
         t0 = _time.time()
         for step in range(start_step, start_step + n_steps):
             key, sk = jr.split(key)
             lam_rec, lam_ov = schedule(step)
-            params, opt_state, total, aux = _step(params, opt_state, sk, real_imgs, lam_rec, lam_ov)
+            params, opt_state, total, aux = _step(params, opt_state, sk, img_full_, lam_rec, lam_ov)
             if step % LOG_EVERY == 0 or step == start_step + n_steps - 1:
                 l = float(total); n = float(aux[0]); r = float(aux[1]); ov = float(aux[2])
                 history.append((step, l, n, r, ov))
-                print(f"step {step:5d}  lam_rec={float(lam_rec):6.1f}  total={l:9.2f}  "
+                print(f"step {step:5d}  lr={float(lam_rec):6.0f}  total={l:9.2f}  "
                       f"npe={n:9.2f}  rec={r:.4f}  ov={ov:.3f}  "
                       f"({(_time.time()-t0)/(step-start_step+1)*1000:.1f} ms/step)")
         return params, opt_state, key, history
 
     # Initialise params and optimiser
-    init_key = jr.PRNGKey(0)
-    params = _init_params(init_key)
-    opt_state = _optimizer.init(params)
-
-    # Train (resumable: re-running this cell continues with current params)
-    params, opt_state, train_key, history = _train(
-        N_STEPS, params, opt_state, jr.PRNGKey(2024), real_tiles,
-    )
-    print("done")
-
-    return (params,)
+    # Continue training from current params (assumes a prior cell run trained the
+    # baseline). To reset from scratch, set RESET=True or restart kernel.
+    # Loop made opt-in to avoid auto-triggering during diagnostics. Set TRAIN=True
+    # below and re-run THIS cell to train. Results land in `params_out` /
+    # `opt_state_out` -- assign them to `params` / `opt_state` upstream by editing
+    # the init cell once you have a good run.
+    TRAIN = False
+    if TRAIN:
+        opt_state_local = _optimizer.init(params)
+        params_out, opt_state_out, train_key, history = _train(
+            N_STEPS_CONTINUE, params, opt_state_local, jr.PRNGKey(2024), img_full,
+            start_step=0,
+        )
+        print("done training", N_STEPS_CONTINUE, "steps; trained weights in params_out")
+    else:
+        print("training disabled (set TRAIN=True to enable).")
+        params_out = None; opt_state_out = None; train_key = None; history = []
+    return (sim_batch,)
 
 
 @app.cell(hide_code=True)
@@ -808,7 +860,106 @@ def _(
         return fig
 
     _show_inference(params, real_tiles, n=6)
+    return
 
+
+@app.cell(hide_code=True)
+def _(
+    encoder_module,
+    jax,
+    jnp,
+    jr,
+    likelihood_module,
+    np,
+    params,
+    post_log_prob_set,
+    posterior_module,
+    real_tiles,
+    sim_batch,
+    true_latents_to_unconstrained,
+    vmap,
+):
+    # --- Fail-fast encoder/model diagnostic ----------------------------------
+    # Runs in seconds. Detects:
+    #   1. Encoder collapse (participation ratio of embedding too low)
+    #   2. Embeddings indistinguishable across simulated tiles
+    #   3. Vanishing NPE gradient w.r.t. encoder params
+
+    def diagnostic(params, n_tiles=32, seed=0, verbose=True):
+        """Return (metrics dict, checks dict). All cheap to compute."""
+        lik_pp = {"params": params["likelihood$params"]}
+        lik = lambda bg, comp, off, ls: likelihood_module.apply(lik_pp, bg, comp, off, ls)
+        _, sim_imgs = sim_batch(jr.PRNGKey(seed), lik, n_tiles)
+
+        enc_p = {"params": params["encoder$params"]}
+        @jax.jit
+        def _emb_batch(imgs):
+            return vmap(lambda x: encoder_module.apply(enc_p, x))(imgs)
+        E = np.asarray(_emb_batch(sim_imgs))
+
+        Ec = E - E.mean(0, keepdims=True)
+        _, S, _ = np.linalg.svd(Ec, full_matrices=False)
+        pr = float((S**2).sum()**2 / ((S**4).sum() + 1e-12))
+        rank_1pct = int((S / S[0] > 0.01).sum())
+
+        En = E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-9)
+        C = En @ En.T
+        off = C[~np.eye(n_tiles, dtype=bool)]
+        cos_med = float(np.median(off))
+        cos_max = float(np.max(off))
+
+        ER = np.asarray(_emb_batch(real_tiles))
+        real_std = float(ER.std(0).mean())
+        sim_std = float(E.std(0).mean())
+
+        sim_lats, sim_imgs_g = sim_batch(jr.PRNGKey(seed + 1), lik, 4)
+        def _npe_loss(enc_params_only):
+            def per(i, img):
+                lats_i = jax.tree_util.tree_map(lambda v: v[i], sim_lats)
+                emb = encoder_module.apply({"params": enc_params_only}, img)
+                bg_head, slot_head = posterior_module.apply(
+                    {"params": params["posterior$params"]}, emb)
+                bg_u, slots_u = true_latents_to_unconstrained(lats_i)
+                mask = (lats_i["presence"] > 0.5).astype(jnp.float32)
+                return -post_log_prob_set(bg_head, slot_head, bg_u, slots_u, mask)
+            return vmap(per)(jnp.arange(4), sim_imgs_g).mean()
+        g = jax.grad(_npe_loss)(params["encoder$params"])
+        g_norm = float(jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(g))))
+
+        metrics = dict(
+            emb_dim=E.shape[1],
+            participation_ratio=pr,
+            rank_at_1pct=rank_1pct,
+            median_offdiag_cos=cos_med,
+            max_offdiag_cos=cos_max,
+            emb_std_sim=sim_std,
+            emb_std_real=real_std,
+            sim_vs_real_std_ratio=sim_std / max(real_std, 1e-9),
+            npe_grad_norm=g_norm,
+        )
+        checks = dict(
+            pr_ok=pr >= 8.0,
+            diversity_ok=cos_med < 0.9,
+            no_real_collapse=real_std > 0.5 * sim_std,
+            grad_ok=g_norm > 1e-3,
+        )
+        if verbose:
+            for k, v in metrics.items():
+                if isinstance(v, float):
+                    print(f"  {k:>26}: {v:.4f}")
+                else:
+                    print(f"  {k:>26}: {v}")
+            print()
+            for k, ok in checks.items():
+                mark = "OK  " if ok else "FAIL"
+                print(f"  [{mark}] {k}")
+        return metrics, checks
+
+    print("=== diagnostic on current trained params ===")
+    m, c = diagnostic(params)
+    verdict = "PASS" if all(c.values()) else "FAIL"
+    print()
+    print("OVERALL:", verdict)
     return
 
 
