@@ -1,3 +1,9 @@
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "marimo",
+# ]
+# ///
 import marimo
 
 __generated_with = "0.23.8"
@@ -780,7 +786,7 @@ def _(
     # below and re-run THIS cell to train. Results land in `params_out` /
     # `opt_state_out` -- assign them to `params` / `opt_state` upstream by editing
     # the init cell once you have a good run.
-    TRAIN = False
+    TRAIN = True
     if TRAIN:
         opt_state_local = _optimizer.init(params)
         params_out, opt_state_out, train_key, history = _train(
@@ -795,98 +801,35 @@ def _(
 
 
 @app.cell(hide_code=True)
-def _(
-    N_SLOTS,
-    TILE_H,
-    TILE_W,
-    encoder_module,
-    jax,
-    jnp,
-    likelihood_module,
-    np,
-    params,
-    plt,
-    posterior_module,
-    real_tiles,
-    simulate_tile,
-    unconstrained_to_latents,
-):
-    # --- Inspect amortized posterior on real tiles ----------------------------
-
-    def _bound_apply_one(module, params, suffix):
-        p = {"params": params[f"{suffix}$params"]}
-        return lambda x: module.apply(p, x)
-
-    def _bound_apply_lik(params):
-        p = {"params": params["likelihood$params"]}
-        return lambda bg, comp, off, ls: likelihood_module.apply(p, bg, comp, off, ls)
-
-    @jax.jit
-    def infer_latents_mean(params, image):
-        encoder = _bound_apply_one(encoder_module, params, "encoder")
-        posterior = _bound_apply_one(posterior_module, params, "posterior")
-        emb = encoder(image)
-        bg_head, slot_head = posterior(emb)
-        bg_u = bg_head[:, 0]; slots_u = slot_head[..., 0]
-        return unconstrained_to_latents(bg_u, slots_u)
-
-    @jax.jit
-    def infer_and_render(params, image):
-        latents = infer_latents_mean(params, image)
-        likelihood = _bound_apply_lik(params)
-        return latents, simulate_tile(likelihood, latents)
-
-    def _show_inference(params, real_tiles, n=6):
-        fig, axes = plt.subplots(n, 3, figsize=(9, 3 * n))
-        for i in range(n):
-            img = real_tiles[i]
-            latents, recon = infer_and_render(params, img)
-            latents_np = {k: np.asarray(v) for k, v in latents.items()}
-            recon_np = np.clip(np.asarray(recon), 0.0, 1.0)
-            axes[i, 0].imshow(np.asarray(img)); axes[i, 0].set_title(f"real {i}")
-            axes[i, 1].imshow(recon_np); axes[i, 1].set_title("reconstruction")
-            axes[i, 2].imshow(np.asarray(img))
-            for s in range(N_SLOTS):
-                pres = float(latents_np["presence"][s])
-                if pres < 0.3: continue
-                cy, cx = latents_np["centers"][s]
-                scale = float(jnp.exp(latents_np["log_scale"][s]))
-                axes[i, 2].add_patch(plt.Circle((cx, cy), scale, fill=False,
-                    edgecolor="red", linewidth=0.5 + 1.5 * pres, alpha=min(1.0, pres)))
-            axes[i, 2].set_title(f"inferred (n={int((latents_np['presence']>0.5).sum())})")
-            for a in axes[i]: a.set_xticks([]); a.set_yticks([])
-            axes[i, 2].set_xlim(0, TILE_W); axes[i, 2].set_ylim(TILE_H, 0)
-        fig.tight_layout()
-        return fig
-
-    _show_inference(params, real_tiles, n=6)
+def _():
+    # Inference cell disabled while we stabilise training.
+    print("Hstk: disabled")
     return
 
 
 @app.cell(hide_code=True)
 def _(
     encoder_module,
+    img_full,
     jax,
     jnp,
     jr,
     likelihood_module,
     np,
-    params,
     post_log_prob_set,
     posterior_module,
-    real_tiles,
+    random_crop_batch,
     sim_batch,
     true_latents_to_unconstrained,
     vmap,
 ):
     # --- Fail-fast encoder/model diagnostic ----------------------------------
     # Runs in seconds. Detects:
-    #   1. Encoder collapse (participation ratio of embedding too low)
-    #   2. Embeddings indistinguishable across simulated tiles
-    #   3. Vanishing NPE gradient w.r.t. encoder params
+    #   1. Encoder collapse (participation ratio too low)
+    #   2. Embeddings indistinguishable
+    #   3. Vanishing NPE gradient
 
-    def diagnostic(params, n_tiles=32, seed=0, verbose=True):
-        """Return (metrics dict, checks dict). All cheap to compute."""
+    def diagnostic(params, n_tiles=8, seed=0, verbose=True):
         lik_pp = {"params": params["likelihood$params"]}
         lik = lambda bg, comp, off, ls: likelihood_module.apply(lik_pp, bg, comp, off, ls)
         _, sim_imgs = sim_batch(jr.PRNGKey(seed), lik, n_tiles)
@@ -908,11 +851,12 @@ def _(
         cos_med = float(np.median(off))
         cos_max = float(np.max(off))
 
-        ER = np.asarray(_emb_batch(real_tiles))
+        real_crops = random_crop_batch(img_full, jr.PRNGKey(seed + 100), n_tiles)
+        ER = np.asarray(_emb_batch(real_crops))
         real_std = float(ER.std(0).mean())
         sim_std = float(E.std(0).mean())
 
-        sim_lats, sim_imgs_g = sim_batch(jr.PRNGKey(seed + 1), lik, 4)
+        sim_lats, sim_imgs_g = sim_batch(jr.PRNGKey(seed + 1), lik, n_tiles)
         def _npe_loss(enc_params_only):
             def per(i, img):
                 lats_i = jax.tree_util.tree_map(lambda v: v[i], sim_lats)
@@ -922,7 +866,7 @@ def _(
                 bg_u, slots_u = true_latents_to_unconstrained(lats_i)
                 mask = (lats_i["presence"] > 0.5).astype(jnp.float32)
                 return -post_log_prob_set(bg_head, slot_head, bg_u, slots_u, mask)
-            return vmap(per)(jnp.arange(4), sim_imgs_g).mean()
+            return vmap(per)(jnp.arange(n_tiles), sim_imgs_g).mean()
         g = jax.grad(_npe_loss)(params["encoder$params"])
         g_norm = float(jnp.sqrt(sum((x**2).sum() for x in jax.tree_util.tree_leaves(g))))
 
@@ -955,11 +899,8 @@ def _(
                 print(f"  [{mark}] {k}")
         return metrics, checks
 
-    print("=== diagnostic on current trained params ===")
-    m, c = diagnostic(params)
-    verdict = "PASS" if all(c.values()) else "FAIL"
-    print()
-    print("OVERALL:", verdict)
+    print("diagnostic ready (call diagnostic(params_out))")
+
     return
 
 
