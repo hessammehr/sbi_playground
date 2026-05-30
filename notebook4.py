@@ -8,6 +8,7 @@
 #     "numpyro==0.21.0",
 #     "optax==0.2.8",
 #     "pillow==12.2.0",
+#     "tqdm==4.67.3",
 # ]
 # requires-python = ">=3.13"
 # ///
@@ -20,6 +21,11 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    import os
+
+    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    os.environ['JAX_PLATFORMS']= 'cuda'
+
     import math
 
     import marimo as mo
@@ -34,6 +40,7 @@ def _():
     import numpyro.distributions as dist
     from numpyro.infer import Predictive
     from numpyro.infer.util import log_density
+    from tqdm.auto import tqdm
 
     jax.config.update("jax_enable_x64", False)
     numpyro.set_host_device_count(1)
@@ -84,6 +91,7 @@ def _():
         numpyro,
         plt,
         random,
+        tqdm,
     )
 
 
@@ -4571,23 +4579,18 @@ def _(mo):
 
 
 @app.cell
-def _(LATENT_SITE_NAMES_V3, Predictive, jax, mo, patch_model_v3, random):
-    M3_V3_TRAIN_SIZE = 2048
+def _(LATENT_SITE_NAMES_V3, Predictive, mo, patch_model_v3, random):
+    M3_V3_TRAIN_SIZE = 16000
     M3_V3_VAL_SIZE = 512
     M3_V3_BATCH_SIZE = 64
-    M3_V3_NUM_STEPS = 1800
+    M3_V3_NUM_STEPS = 3600
     M3_V3_EVAL_EVERY = 200
 
-    CPU_DEVICE_V3_M3 = jax.devices("cpu")[0]
-    with jax.default_device(CPU_DEVICE_V3_M3):
-        synthetic_all_v3_m3 = Predictive(
-            patch_model_v3,
-            num_samples=M3_V3_TRAIN_SIZE + M3_V3_VAL_SIZE,
-            return_sites=(*LATENT_SITE_NAMES_V3, "obs_v3", "mean_v3", "count_v3"),
-        )(random.PRNGKey(4101))
-    synthetic_all_v3_m3 = jax.tree_util.tree_map(
-        lambda _x: jax.device_put(_x, CPU_DEVICE_V3_M3), synthetic_all_v3_m3
-    )
+    synthetic_all_v3_m3 = Predictive(
+        patch_model_v3,
+        num_samples=M3_V3_TRAIN_SIZE + M3_V3_VAL_SIZE,
+        return_sites=(*LATENT_SITE_NAMES_V3, "obs_v3", "mean_v3", "count_v3"),
+    )(random.PRNGKey(4101))
     synthetic_train_v3_m3 = {name: value[:M3_V3_TRAIN_SIZE] for name, value in synthetic_all_v3_m3.items()}
     synthetic_val_v3_m3 = {name: value[M3_V3_TRAIN_SIZE:] for name, value in synthetic_all_v3_m3.items()}
 
@@ -4597,7 +4600,6 @@ def _(LATENT_SITE_NAMES_V3, Predictive, jax, mo, patch_model_v3, random):
         f"Training image shape: `{tuple(synthetic_train_v3_m3['obs_v3'].shape)}`."
     )
     return (
-        CPU_DEVICE_V3_M3,
         M3_V3_BATCH_SIZE,
         M3_V3_EVAL_EVERY,
         M3_V3_NUM_STEPS,
@@ -4638,13 +4640,11 @@ def _(LATENT_SITE_NAMES_V3, guide_log_prob_v3, jax, jnp, optax):
 
 @app.cell
 def _(
-    CPU_DEVICE_V3_M3,
     M3_V3_BATCH_SIZE,
     M3_V3_EVAL_EVERY,
     M3_V3_NUM_STEPS,
     M3_V3_TRAIN_SIZE,
     guide_params_v3_m2,
-    jax,
     jnp,
     mo,
     npe_loss_v3_m3,
@@ -4654,8 +4654,9 @@ def _(
     select_batch_v3_m3,
     synthetic_train_v3_m3,
     synthetic_val_v3_m3,
+    tqdm,
 ):
-    guide_params_current_v3_m3 = jax.tree_util.tree_map(lambda _x: jax.device_put(_x, CPU_DEVICE_V3_M3), guide_params_v3_m2)
+    guide_params_current_v3_m3 = guide_params_v3_m2
     opt_state_v3_m3 = optimizer_v3_m3.init(guide_params_current_v3_m3)
     initial_train_loss_v3_m3 = float(
         npe_loss_v3_m3(
@@ -4670,7 +4671,7 @@ def _(
     training_history_v3_m3 = [(0, initial_train_loss_v3_m3, initial_val_loss_v3_m3)]
 
     training_key_v3_m3 = random.PRNGKey(4102)
-    for step_v3_m3 in range(1, M3_V3_NUM_STEPS + 1):
+    for step_v3_m3 in tqdm(range(1, M3_V3_NUM_STEPS + 1), miniters=100):
         training_key_v3_m3, subkey_v3_m3 = random.split(training_key_v3_m3)
         batch_indices_v3_m3 = random.choice(
             subkey_v3_m3,
@@ -4977,7 +4978,6 @@ def _(
 
 @app.cell
 def _(
-    CPU_DEVICE_V3_M3,
     LATENT_SITE_NAMES_V3,
     Predictive,
     guide_log_prob_v3,
@@ -4993,15 +4993,11 @@ def _(
     M3_V3_TINY_OVERFIT_N = 24
     M3_V3_TINY_OVERFIT_STEPS = 1000
 
-    with jax.default_device(CPU_DEVICE_V3_M3):
-        tiny_overfit_data_v3_m3 = Predictive(
-            patch_model_v3,
-            num_samples=M3_V3_TINY_OVERFIT_N,
-            return_sites=(*LATENT_SITE_NAMES_V3, "obs_v3", "mean_v3", "count_v3"),
-        )(random.PRNGKey(4201))
-    tiny_overfit_data_v3_m3 = jax.tree_util.tree_map(
-        lambda _x: jax.device_put(_x, CPU_DEVICE_V3_M3), tiny_overfit_data_v3_m3
-    )
+    tiny_overfit_data_v3_m3 = Predictive(
+        patch_model_v3,
+        num_samples=M3_V3_TINY_OVERFIT_N,
+        return_sites=(*LATENT_SITE_NAMES_V3, "obs_v3", "mean_v3", "count_v3"),
+    )(random.PRNGKey(4201))
 
 
     def tiny_overfit_loss_v3_m3(guide_params):
@@ -5025,7 +5021,7 @@ def _(
         return guide_params, opt_state, loss_value
 
 
-    tiny_params_current_v3_m3 = jax.tree_util.tree_map(lambda _x: jax.device_put(_x, CPU_DEVICE_V3_M3), guide_params_v3_m2)
+    tiny_params_current_v3_m3 = guide_params_v3_m2
     tiny_opt_state_v3_m3 = tiny_optimizer_v3_m3.init(tiny_params_current_v3_m3)
     tiny_initial_loss_v3_m3 = float(tiny_overfit_loss_v3_m3(tiny_params_current_v3_m3))
     tiny_best_loss_v3_m3 = tiny_initial_loss_v3_m3
