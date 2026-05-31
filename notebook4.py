@@ -3635,7 +3635,7 @@ def _(jnp, mo):
     SLOT_ROWS_V3 = 4
     SLOT_COLS_V3 = 4
     MAX_OBJECTS_V3 = SLOT_ROWS_V3 * SLOT_COLS_V3
-    COMPOSITION_DIM_V3 = 4
+    COMPOSITION_DIM_V3 = 3
     SIZE_LOW_V3 = 0.025
     SIZE_HIGH_V3 = 0.085
     LATENT_SITE_NAMES_V3 = (
@@ -3675,6 +3675,8 @@ def _(jnp, mo):
         POSITION_SCALE_V3,
         SIZE_HIGH_V3,
         SIZE_LOW_V3,
+        SLOT_COLS_V3,
+        SLOT_ROWS_V3,
     )
 
 
@@ -3931,8 +3933,8 @@ def _(
     control_position_v3 = POSITION_CENTER_V3
     control_size_v3 = 0.060 * jnp.ones(MAX_OBJECTS_V3, dtype=jnp.float32)
     control_composition_base_v3 = jnp.ones((MAX_OBJECTS_V3, COMPOSITION_DIM_V3), dtype=jnp.float32) / COMPOSITION_DIM_V3
-    control_composition_a_v3 = control_composition_base_v3.at[5].set(jnp.array([0.90, 0.04, 0.03, 0.03], dtype=jnp.float32))
-    control_composition_b_v3 = control_composition_base_v3.at[5].set(jnp.array([0.03, 0.90, 0.04, 0.03], dtype=jnp.float32))
+    control_composition_a_v3 = control_composition_base_v3.at[5].set(jnp.array([0.90, 0.06, 0.04], dtype=jnp.float32))
+    control_composition_b_v3 = control_composition_base_v3.at[5].set(jnp.array([0.05, 0.90, 0.05], dtype=jnp.float32))
     mean_comp_a_v3 = render_scene_v3(control_background_v3, control_presence_v3, control_position_v3, control_size_v3, control_composition_a_v3)
     mean_comp_b_v3 = render_scene_v3(control_background_v3, control_presence_v3, control_position_v3, control_size_v3, control_composition_b_v3)
     composition_change_diff_v3 = float(jnp.max(jnp.abs(mean_comp_a_v3 - mean_comp_b_v3)))
@@ -3940,7 +3942,7 @@ def _(
 
     single_center_position_v3 = jnp.tile(jnp.array([[0.5, 0.5]], dtype=jnp.float32), (MAX_OBJECTS_V3, 1))
     single_presence_v3 = jnp.zeros(MAX_OBJECTS_V3, dtype=jnp.float32).at[0].set(1.0)
-    single_composition_v3 = control_composition_base_v3.at[0].set(jnp.array([0.05, 0.75, 0.10, 0.10], dtype=jnp.float32))
+    single_composition_v3 = control_composition_base_v3.at[0].set(jnp.array([0.05, 0.85, 0.10], dtype=jnp.float32))
     single_size_v3 = 0.060 * jnp.ones(MAX_OBJECTS_V3, dtype=jnp.float32)
     single_sprite_v3 = render_scene_v3(control_background_v3, single_presence_v3, single_center_position_v3, single_size_v3, single_composition_v3)
     vertical_flip_diff_v3 = float(jnp.mean(jnp.abs(single_sprite_v3 - jnp.flip(single_sprite_v3, axis=0))))
@@ -4004,10 +4006,9 @@ def _(
 ):
     sprite_compositions_v3 = jnp.array(
         [
-            [0.90, 0.04, 0.03, 0.03],
-            [0.04, 0.90, 0.03, 0.03],
-            [0.03, 0.04, 0.90, 0.03],
-            [0.03, 0.04, 0.03, 0.90],
+            [0.90, 0.06, 0.04],
+            [0.05, 0.90, 0.05],
+            [0.04, 0.06, 0.90],
         ],
         dtype=jnp.float32,
     )
@@ -4173,6 +4174,8 @@ def _(
     POSITION_SCALE_V3,
     SIZE_HIGH_V3,
     SIZE_LOW_V3,
+    SLOT_COLS_V3,
+    SLOT_ROWS_V3,
     dist,
     jax,
     jnn,
@@ -4180,15 +4183,17 @@ def _(
     numpyro,
     random,
 ):
-    GUIDE_HIDDEN_DIM_V3 = 192
-    GUIDE_OUTPUT_DIM_V3 = (
-        2 * CHANNELS_V3  # scaled-Beta background RGB alpha/beta
-        + 2  # LogNormal noise loc/scale
-        + MAX_OBJECTS_V3  # Bernoulli presence logits
-        + MAX_OBJECTS_V3 * 2 * 2  # position Beta alpha/beta for y/x
-        + MAX_OBJECTS_V3 * 2  # size Beta alpha/beta
-        + MAX_OBJECTS_V3 * COMPOSITION_DIM_V3  # Dirichlet concentrations
-    )
+    # Slot-aligned amortised guide. The earlier strided-CNN->flatten->shared-FC head
+    # globally pooled features and destroyed per-object colour, collapsing composition
+    # to the dataset mean. This guide keeps spatial alignment: a conv stack produces a
+    # feature map at the slot-grid resolution, and a shared per-slot MLP reads the
+    # features located at each anchored slot (plus a global-context vector). This is
+    # still a NumPyro guide q_phi(theta|x); it is an architecture change, not a trick.
+
+    GUIDE_SLOT_HID_V3 = 160
+    SLOT_PER_OUT_V3 = 1 + 2 * 2 + 2 + COMPOSITION_DIM_V3  # presence, pos(2x2), size(2), comp
+    GLOBAL_OUT_V3 = 2 * CHANNELS_V3 + 2  # bg rgb alpha/beta, noise loc/scale
+    SLOT_BLOCK_V3 = 16 // SLOT_ROWS_V3  # feature-map cells per slot side at 16x16
 
 
     def softplus_inverse_v3(y):
@@ -4200,36 +4205,37 @@ def _(
         return jnn.softplus(raw) + floor
 
 
-    def initial_guide_output_bias_v3():
-        pieces = [
-            jnp.full((2 * CHANNELS_V3,), softplus_inverse_v3(4.0)),
-            jnp.array([jnp.log(0.018), softplus_inverse_v3(0.30)]),
-            jnp.full((MAX_OBJECTS_V3,), jnp.log(0.35 / 0.65)),
-            jnp.full((MAX_OBJECTS_V3 * 2 * 2,), softplus_inverse_v3(2.0)),
-            jnp.full((MAX_OBJECTS_V3 * 2,), softplus_inverse_v3(2.0)),
-            jnp.full((MAX_OBJECTS_V3 * COMPOSITION_DIM_V3,), softplus_inverse_v3(1.2)),
-        ]
-        return jnp.concatenate([piece.reshape(-1) for piece in pieces]).astype(jnp.float32)
-
-
-    def init_guide_params_v3(key, hidden_dim=GUIDE_HIDDEN_DIM_V3):
-        key_c1, key_c2, key_c3, key_fc, key_out = random.split(key, 5)
+    def init_guide_params_v3(key, slot_hidden=GUIDE_SLOT_HID_V3):
+        ks = random.split(key, 8)
+        global_bias = jnp.concatenate(
+            [
+                jnp.full((2 * CHANNELS_V3,), softplus_inverse_v3(4.0)),
+                jnp.array([jnp.log(0.018), softplus_inverse_v3(0.30)]),
+            ]
+        ).astype(jnp.float32)
+        per_bias = jnp.concatenate(
+            [
+                jnp.array([jnp.log(0.35 / 0.65)]),
+                jnp.full((2 * 2,), softplus_inverse_v3(2.0)),
+                jnp.full((2,), softplus_inverse_v3(2.0)),
+                jnp.full((COMPOSITION_DIM_V3,), softplus_inverse_v3(1.2)),
+            ]
+        ).astype(jnp.float32)
         return {
-            "conv1": random.normal(key_c1, (5, 5, CHANNELS_V3, 24), dtype=jnp.float32)
-            * jnp.sqrt(2.0 / (5 * 5 * CHANNELS_V3)),
-            "bconv1": jnp.zeros((24,), dtype=jnp.float32),
-            "conv2": random.normal(key_c2, (5, 5, 24, 48), dtype=jnp.float32)
-            * jnp.sqrt(2.0 / (5 * 5 * 24)),
-            "bconv2": jnp.zeros((48,), dtype=jnp.float32),
-            "conv3": random.normal(key_c3, (3, 3, 48, 64), dtype=jnp.float32)
-            * jnp.sqrt(2.0 / (3 * 3 * 48)),
-            "bconv3": jnp.zeros((64,), dtype=jnp.float32),
-            "w_fc": random.normal(key_fc, (8 * 8 * 64, hidden_dim), dtype=jnp.float32)
-            * jnp.sqrt(2.0 / (8 * 8 * 64)),
-            "b_fc": jnp.zeros((hidden_dim,), dtype=jnp.float32),
-            "w_out": random.normal(key_out, (hidden_dim, GUIDE_OUTPUT_DIM_V3), dtype=jnp.float32)
-            * 0.02,
-            "b_out": initial_guide_output_bias_v3(),
+            "conv1": random.normal(ks[0], (5, 5, CHANNELS_V3, 32), dtype=jnp.float32) * jnp.sqrt(2.0 / (5 * 5 * CHANNELS_V3)),
+            "bconv1": jnp.zeros((32,), dtype=jnp.float32),
+            "conv2": random.normal(ks[1], (3, 3, 32, 64), dtype=jnp.float32) * jnp.sqrt(2.0 / (3 * 3 * 32)),
+            "bconv2": jnp.zeros((64,), dtype=jnp.float32),
+            "conv3": random.normal(ks[2], (3, 3, 64, 96), dtype=jnp.float32) * jnp.sqrt(2.0 / (3 * 3 * 64)),
+            "bconv3": jnp.zeros((96,), dtype=jnp.float32),
+            "slot_w1": random.normal(ks[3], (96 * 2, slot_hidden), dtype=jnp.float32) * jnp.sqrt(2.0 / (96 * 2)),
+            "slot_b1": jnp.zeros((slot_hidden,), dtype=jnp.float32),
+            "slot_w2": random.normal(ks[4], (slot_hidden, slot_hidden), dtype=jnp.float32) * jnp.sqrt(2.0 / slot_hidden),
+            "slot_b2": jnp.zeros((slot_hidden,), dtype=jnp.float32),
+            "slot_w3": random.normal(ks[5], (slot_hidden, SLOT_PER_OUT_V3), dtype=jnp.float32) * 0.02,
+            "slot_b3": per_bias,
+            "global_w": random.normal(ks[6], (96, GLOBAL_OUT_V3), dtype=jnp.float32) * 0.02,
+            "global_b": global_bias,
         }
 
 
@@ -4255,33 +4261,43 @@ def _(
         )
 
 
-    def guide_forward_v3(guide_params, image):
+    def guide_features_v3(guide_params, image):
+        """Conv stack producing a 16x16 feature map (slot-grid aligned), plus per-slot
+        and global feature vectors. Spatial alignment is the key to per-object colour."""
         image_batch, _ = ensure_image_batch_v3(image)
-        features = image_batch
-        features = jnn.relu(conv2d_same_v3(features, guide_params["conv1"], guide_params["bconv1"], stride=2))
-        features = jnn.relu(conv2d_same_v3(features, guide_params["conv2"], guide_params["bconv2"], stride=2))
-        features = jnn.relu(conv2d_same_v3(features, guide_params["conv3"], guide_params["bconv3"], stride=2))
-        flat = features.reshape((features.shape[0], -1))
-        hidden = jnn.relu(flat @ guide_params["w_fc"] + guide_params["b_fc"])
-        return hidden @ guide_params["w_out"] + guide_params["b_out"]
+        features = jnn.relu(conv2d_same_v3(image_batch, guide_params["conv1"], guide_params["bconv1"], stride=2))  # 32x32
+        features = jnn.relu(conv2d_same_v3(features, guide_params["conv2"], guide_params["bconv2"], stride=2))  # 16x16
+        features = jnn.relu(conv2d_same_v3(features, guide_params["conv3"], guide_params["bconv3"], stride=1))  # 16x16x96
+        batch = features.shape[0]
+        feat_dim = features.shape[-1]
+        pooled_per_slot = features.reshape(
+            batch, SLOT_ROWS_V3, SLOT_BLOCK_V3, SLOT_COLS_V3, SLOT_BLOCK_V3, feat_dim
+        ).mean(axis=(2, 4)).reshape(batch, MAX_OBJECTS_V3, feat_dim)
+        global_feature = features.mean(axis=(1, 2))
+        return pooled_per_slot, global_feature
 
 
-    def parse_guide_output_v3(raw_output):
-        idx = 0
-        bg_raw = raw_output[:, idx : idx + 2 * CHANNELS_V3].reshape((-1, CHANNELS_V3, 2))
-        idx += 2 * CHANNELS_V3
-        noise_raw = raw_output[:, idx : idx + 2]
-        idx += 2
-        presence_logits = raw_output[:, idx : idx + MAX_OBJECTS_V3]
-        idx += MAX_OBJECTS_V3
-        position_raw = raw_output[:, idx : idx + MAX_OBJECTS_V3 * 2 * 2].reshape((-1, MAX_OBJECTS_V3, 2, 2))
-        idx += MAX_OBJECTS_V3 * 2 * 2
-        size_raw = raw_output[:, idx : idx + MAX_OBJECTS_V3 * 2].reshape((-1, MAX_OBJECTS_V3, 2))
-        idx += MAX_OBJECTS_V3 * 2
-        composition_raw = raw_output[:, idx : idx + MAX_OBJECTS_V3 * COMPOSITION_DIM_V3].reshape((-1, MAX_OBJECTS_V3, COMPOSITION_DIM_V3))
-        idx += MAX_OBJECTS_V3 * COMPOSITION_DIM_V3
-        if idx != GUIDE_OUTPUT_DIM_V3:
-            raise RuntimeError("v3 guide output parser consumed the wrong number of entries")
+    def guide_raw_outputs_v3(guide_params, image):
+        pooled_per_slot, global_feature = guide_features_v3(guide_params, image)
+        batch = pooled_per_slot.shape[0]
+        slot_input = jnp.concatenate(
+            [pooled_per_slot, jnp.broadcast_to(global_feature[:, None, :], pooled_per_slot.shape)], axis=-1
+        )
+        hidden = jnn.relu(jnp.einsum("bof,fh->boh", slot_input, guide_params["slot_w1"]) + guide_params["slot_b1"])
+        hidden = jnn.relu(jnp.einsum("boh,hk->bok", hidden, guide_params["slot_w2"]) + guide_params["slot_b2"])
+        per_slot = jnp.einsum("bok,kq->boq", hidden, guide_params["slot_w3"]) + guide_params["slot_b3"]
+        global_out = global_feature @ guide_params["global_w"] + guide_params["global_b"]
+        return per_slot, global_out
+
+
+    def parse_guide_output_v3(guide_params, image):
+        per_slot, global_out = guide_raw_outputs_v3(guide_params, image)
+        presence_logits = per_slot[..., 0]
+        position_raw = per_slot[..., 1:5].reshape((-1, MAX_OBJECTS_V3, 2, 2))
+        size_raw = per_slot[..., 5:7]
+        composition_raw = per_slot[..., 7 : 7 + COMPOSITION_DIM_V3]
+        bg_raw = global_out[:, : 2 * CHANNELS_V3].reshape((-1, CHANNELS_V3, 2))
+        noise_raw = global_out[:, 2 * CHANNELS_V3 : 2 * CHANNELS_V3 + 2]
         return {
             "background_alpha": positive_v3(bg_raw[..., 0]),
             "background_beta": positive_v3(bg_raw[..., 1]),
@@ -4297,7 +4313,7 @@ def _(
 
 
     def guide_distribution_params_v3(guide_params, image):
-        return parse_guide_output_v3(guide_forward_v3(guide_params, image))
+        return parse_guide_output_v3(guide_params, image)
 
 
     def make_guide_distributions_v3(parsed_params):
@@ -4366,12 +4382,8 @@ def _(
         presence_probs = jnn.sigmoid(parsed["presence_logits"])
         position_unit = parsed["position_alpha"] / (parsed["position_alpha"] + parsed["position_beta"])
         position = POSITION_LOW_V3 + POSITION_SCALE_V3 * position_unit
-        size = SIZE_LOW_V3 + (SIZE_HIGH_V3 - SIZE_LOW_V3) * parsed["size_alpha"] / (
-            parsed["size_alpha"] + parsed["size_beta"]
-        )
-        composition = parsed["composition_concentration"] / jnp.sum(
-            parsed["composition_concentration"], axis=-1, keepdims=True
-        )
+        size = SIZE_LOW_V3 + (SIZE_HIGH_V3 - SIZE_LOW_V3) * parsed["size_alpha"] / (parsed["size_alpha"] + parsed["size_beta"])
+        composition = parsed["composition_concentration"] / jnp.sum(parsed["composition_concentration"], axis=-1, keepdims=True)
         return {
             "background_rgb_v3": background_rgb,
             "observation_noise_v3": observation_noise,
@@ -4583,7 +4595,7 @@ def _(LATENT_SITE_NAMES_V3, Predictive, mo, patch_model_v3, random):
     M3_V3_TRAIN_SIZE = 16000
     M3_V3_VAL_SIZE = 512
     M3_V3_BATCH_SIZE = 64
-    M3_V3_NUM_STEPS = 3600
+    M3_V3_NUM_STEPS = 10000
     M3_V3_EVAL_EVERY = 200
 
     synthetic_all_v3_m3 = Predictive(
